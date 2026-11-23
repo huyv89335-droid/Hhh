@@ -1,0 +1,133 @@
+package com.autobuilder.schematic;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Dữ liệu schematic đã được chuẩn hoá.
+ *
+ * Bước 2:
+ * - targets sắp xếp "dưới lên trên, trong ra ngoài" để không tự nhốt mình;
+ * - notes chứa việc làm thủ công (ví dụ vị trí nước/lava bị bỏ qua);
+ * - builtIn = true với bản vẽ đóng gói sẵn trong JAR.
+ */
+public final class Schematic {
+    public enum Format {
+        LITEMATIC,
+        SPONGE_SCHEM,
+        BUILT_IN
+    }
+
+    private final String fileName;
+    private final Format format;
+    private final int width;
+    private final int height;
+    private final int length;
+    private final List<Target> targets;
+    private final List<String> notes;
+    private final boolean builtIn;
+
+    public Schematic(String fileName, Format format, List<Target> sortedTargets, List<String> notes, boolean builtIn) {
+        this.fileName = fileName;
+        this.format = format;
+        this.targets = List.copyOf(sortedTargets);
+        this.notes = List.copyOf(notes);
+        this.builtIn = builtIn;
+
+        int maxX = 0;
+        int maxY = 0;
+        int maxZ = 0;
+        for (Target target : this.targets) {
+            maxX = Math.max(maxX, target.x());
+            maxY = Math.max(maxY, target.y());
+            maxZ = Math.max(maxZ, target.z());
+        }
+        this.width = this.targets.isEmpty() ? 0 : maxX + 1;
+        this.height = this.targets.isEmpty() ? 0 : maxY + 1;
+        this.length = this.targets.isEmpty() ? 0 : maxZ + 1;
+    }
+
+    public String fileName() {
+        return fileName;
+    }
+
+    public Format format() {
+        return format;
+    }
+
+    public int width() {
+        return width;
+    }
+
+    public int height() {
+        return height;
+    }
+
+    public int length() {
+        return length;
+    }
+
+    public int blocks() {
+        return targets.size();
+    }
+
+    public List<Target> targets() {
+        return targets;
+    }
+
+    public List<String> notes() {
+        return notes;
+    }
+
+    public boolean builtIn() {
+        return builtIn;
+    }
+
+    public String dimensionsLabel() {
+        return width + "×" + height + "×" + length;
+    }
+
+    public String shortFormatLabel() {
+        return switch (format) {
+            case LITEMATIC -> "LITEMATIC";
+            case SPONGE_SCHEM -> "SPONGE SCHEM";
+            case BUILT_IN -> "CÓ SẴN";
+        };
+    }
+
+    /**
+     * Thứ tự xây: thấp trước, rồi đến gần tâm trước (xa tâm = xây sau).
+     * Xây từ trong ra ngoài để người chơi luôn còn lối thoát.
+     */
+    public static void sortByBuildOrder(List<Target> targets) {
+        int maxX = 0;
+        int maxZ = 0;
+        for (Target target : targets) {
+            maxX = Math.max(maxX, target.x());
+            maxZ = Math.max(maxZ, target.z());
+        }
+        double centerX = maxX / 2.0;
+        double centerZ = maxZ / 2.0;
+        Map<Target, Double> centerDistance = new java.util.HashMap<>();
+        for (Target target : targets) {
+            double dx = target.x() - centerX;
+            double dz = target.z() - centerZ;
+            centerDistance.put(target, dx * dx + dz * dz);
+        }
+        targets.sort(Comparator
+                .comparingInt(Target::y)
+                .thenComparing(centerDistance::get, Comparator.reverseOrder())
+                .thenComparingInt(Target::z)
+                .thenComparingInt(Target::x));
+    }
+
+    /**
+     * Một block tương đối trong schematic.
+     *
+     * state là chuỗi block state đầy đủ, ví dụ:
+     * minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]
+     */
+    public record Target(int x, int y, int z, String state) {
+    }
+}
