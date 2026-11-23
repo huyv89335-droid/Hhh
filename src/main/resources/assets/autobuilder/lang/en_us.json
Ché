@@ -1,0 +1,15 @@
+{
+  "key.categories.autobuilder": "AutoBuilder",
+  "key.category.autobuilder.main": "AutoBuilder",
+  "key.categories.autobuilder.main": "AutoBuilder",
+  "key.autobuilder.open": "Open AutoBuilder",
+  "text.autobuilder.title": "AutoBuilder",
+  "text.autobuilder.ready": "Ready",
+  "text.autobuilder.building": "Building",
+  "text.autobuilder.paused": "Paused",
+  "text.autobuilder.complete": "Build complete",
+  "text.autobuilder.resupply": "Fetching blocks from chest",
+  "text.autobuilder.eating": "Eating",
+  "text.autobuilder.stuck": "Stuck — trying to escape",
+  "text.autobuilder.webhook_sent": "Discord webhook sent"
+}
