@@ -1,0 +1,159 @@
+package com.autobuilder.schematic;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Bản vẽ đóng gói sẵn trong JAR — không cần file .litematic.
+ *
+ * Yêu cầu bước 2: "có luôn bản vẽ khi bật lên". Ba thiết kế được tạo bằng code
+ * để giữ JAR nhẹ và dễ sửa:
+ *
+ * 1. Farm đá cuội v2 — máy farm đá theo yêu cầu ("farm đá joan"). Mod xây toàn bộ
+ *    khung; 2 ô chất lỏng (nước + lava) bị BỎ QUA theo quy tắc an toàn bước 2,
+ *    vị trí được ghi trong notes để bạn đặt thủ công bằng xô.
+ * 2. Kho chứa đồ v2 — sàn 9×7, 7 rương, đuốc, mái kín.
+ * 3. Nhà khởi động v2 — nhà 7×7 có bàn chế tạo, lò nung, rương, cửa kính.
+ *
+ * Đổi tên hoặc thêm bản vẽ mới: tạo hàm riêng rồi thêm vào all().
+ */
+public final class BundledSchematics {
+    private BundledSchematics() {
+    }
+
+    public static List<Schematic> all() {
+        return List.of(cobblestoneFarm(), storageHouse(), starterHouse());
+    }
+
+    private static void add(List<Schematic.Target> targets, int x, int y, int z, String state) {
+        targets.add(new Schematic.Target(x, y, z, state));
+    }
+
+    private static void fill(List<Schematic.Target> targets, String state,
+                             int x1, int y1, int z1, int x2, int y2, int z2) {
+        for (int x = Math.min(x1, x2); x <= Math.max(x1, x2); x++) {
+            for (int y = Math.min(y1, y2); y <= Math.max(y1, y2); y++) {
+                for (int z = Math.min(z1, z2); z <= Math.max(z1, z2); z++) {
+                    add(targets, x, y, z, state);
+                }
+            }
+        }
+    }
+
+    private static Schematic finish(String fileName, List<Schematic.Target> targets, List<String> notes) {
+        Schematic.sortByBuildOrder(targets);
+        return new Schematic(fileName, Schematic.Format.BUILT_IN, List.copyOf(targets), List.copyOf(notes), true);
+    }
+
+    /**
+     * Farm đá cuội v2. Toạ độ đã chuẩn hoá về >= 0.
+     * Nước tại (1,1,0), lava tại (1,1,2); cobble sinh ra tại (1,1,1).
+     */
+    private static Schematic cobblestoneFarm() {
+        List<Schematic.Target> targets = new ArrayList<>();
+        List<String> notes = new ArrayList<>();
+        String stone = "minecraft:stone";
+        String glass = "minecraft:glass";
+
+        // Nền đá 3×4
+        fill(targets, stone, 0, 0, 0, 2, 0, 3);
+        // Tường chắn hai bên máng nước/lava
+        add(targets, stone, 0, 1, 0);
+        add(targets, stone, 2, 1, 0);
+        add(targets, stone, 0, 1, 2);
+        add(targets, stone, 2, 1, 2);
+        // Hai nguồn chất lỏng — controller bỏ qua, ghi chú đặt tay
+        add(targets, "minecraft:water", 1, 1, 0);
+        add(targets, "minecraft:lava", 1, 1, 2);
+        // Nắp kính để nhìn thấy cobble mà không rơi vào
+        add(targets, glass, 0, 2, 0);
+        add(targets, glass, 1, 2, 0);
+        add(targets, glass, 2, 2, 0);
+        add(targets, glass, 0, 2, 1);
+        add(targets, glass, 2, 2, 1);
+        add(targets, glass, 0, 2, 2);
+        add(targets, glass, 1, 2, 2);
+        add(targets, glass, 2, 2, 2);
+        // Rương gom đồ cạnh máy
+        add(targets, "minecraft:chest", 0, 1, 3);
+        // Đuốc soi rương
+        add(targets, "minecraft:torch", 2, 1, 3);
+
+        notes.add("Đặt 1 xô NƯỚC vào ô (1,1,0) — mod không tự đặt chất lỏng.");
+        notes.add("Đặt 1 xô LAVA vào ô (1,1,2) — mod không tự đặt chất lỏng.");
+        notes.add("Đào cobble sinh ra tại ô giữa (1,1,1).");
+        return finish("[Có sẵn] Farm đá cuội v2", targets, notes);
+    }
+
+    /** Kho chứa đồ v2: sàn 9×7, tường cao 3, 7 rương dọc tường sau, 2 đuốc. */
+    private static Schematic storageHouse() {
+        List<Schematic.Target> targets = new ArrayList<>();
+        List<String> notes = new ArrayList<>();
+        String floor = "minecraft:stone_bricks";
+        String wall = "minecraft:oak_planks";
+
+        fill(targets, floor, 0, 0, 0, 8, 0, 6);
+        for (int y = 1; y <= 3; y++) {
+            for (int x = 0; x <= 8; x++) {
+                add(targets, wall, x, y, 0);
+                add(targets, wall, x, y, 6);
+            }
+            for (int z = 1; z <= 5; z++) {
+                add(targets, wall, 0, y, z);
+                add(targets, wall, 8, y, z);
+            }
+        }
+        // Cửa ra vào rộng 1 ở giữa mặt trước
+        targets.removeIf(target -> target.z() == 0 && target.x() == 4 && (target.y() == 1 || target.y() == 2));
+        // 7 rương dọc tường sau
+        for (int x = 1; x <= 7; x++) {
+            add(targets, "minecraft:chest", x, 1, 5);
+        }
+        // Đuốc trong kho
+        add(targets, "minecraft:torch", 2, 1, 2);
+        add(targets, "minecraft:torch", 6, 1, 2);
+        // Mái kín
+        fill(targets, wall, 0, 4, 0, 8, 4, 6);
+
+        notes.add("Rương trống — bước 2 sẽ tự nạp vật liệu vào các rương này khi bạn cấu hình toạ độ rương.");
+        return finish("[Có sẵn] Kho chứa đồ v2", targets, notes);
+    }
+
+    /** Nhà khởi động v2: 7×7, bàn chế tạo + lò nung + 2 rương + cửa kính. */
+    private static Schematic starterHouse() {
+        List<Schematic.Target> targets = new ArrayList<>();
+        List<String> notes = new ArrayList<>();
+        String floor = "minecraft:cobblestone";
+        String wall = "minecraft:oak_planks";
+        String glass = "minecraft:glass";
+
+        fill(targets, floor, 0, 0, 0, 6, 0, 6);
+        for (int y = 1; y <= 3; y++) {
+            for (int x = 0; x <= 6; x++) {
+                add(targets, wall, x, y, 0);
+                add(targets, wall, x, y, 6);
+            }
+            for (int z = 1; z <= 5; z++) {
+                add(targets, wall, 0, y, z);
+                add(targets, wall, 6, y, z);
+            }
+        }
+        // Cửa + 2 ô kính mặt trước
+        targets.removeIf(target -> target.z() == 0 && target.x() == 3 && (target.y() == 1 || target.y() == 2));
+        targets.removeIf(target -> target.z() == 0 && (target.x() == 1 || target.x() == 5) && target.y() == 2);
+        add(targets, glass, 1, 2, 0);
+        add(targets, glass, 5, 2, 0);
+        // Nội thất cơ bản
+        add(targets, "minecraft:crafting_table", 1, 1, 5);
+        add(targets, "minecraft:furnace", 2, 1, 5);
+        add(targets, "minecraft:chest", 5, 1, 5);
+        add(targets, "minecraft:chest", 5, 1, 4);
+        add(targets, "minecraft:torch", 3, 1, 3);
+        add(targets, "minecraft:torch", 1, 1, 1);
+        // Mái
+        fill(targets, wall, 0, 4, 0, 6, 4, 6);
+
+        notes.add("Nhà khởi động — có thể đặt giường thủ công sau (block 2 phần chưa hỗ trợ).");
+        return finish("[Có sẵn] Nhà khởi động v2", targets, notes);
+    }
+}
