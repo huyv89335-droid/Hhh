@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "autobuilder",
+  "version": "${version}",
+  "name": "AutoBuilder",
+  "description": "Bước 2: đọc .litematic/.schem, tự lấy đồ từ rương, chống kẹt, giàn giáo, tự ăn, webhook Discord và 3 bản vẽ có sẵn. Giao diện phẳng, tối giản cho máy yếu.",
+  "authors": [
+    "AutoBuilder Community"
+  ],
+  "contact": {
+    "homepage": "https://fabricmc.net/"
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.autobuilder.AutoBuilderClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": ">=0.141.6"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}
