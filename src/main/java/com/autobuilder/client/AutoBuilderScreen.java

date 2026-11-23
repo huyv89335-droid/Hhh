@@ -1,0 +1,456 @@
+package com.autobuilder.client;
+
+import com.autobuilder.AutoBuilderClient;
+import com.autobuilder.config.AutoBuilderConfig;
+import com.autobuilder.schematic.Schematic;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.text.Text;
+
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * Giao diện tối giản, không render hình khối 3D.
+ *
+ * Chỉ dùng:
+ * - fill và viền 1px cho panel;
+ * - ButtonWidget/TextFieldWidget mặc định của game;
+ * - chữ từ textRenderer.
+ *
+ * Screen mặc định pause singleplayer, nên controller không đặt block trong
+ * lúc bạn đang cấu hình. Đóng GUI (Esc) để tiến trình tiếp tục.
+ */
+public final class AutoBuilderScreen extends Screen {
+    private static final int FILE_ROWS = 4;
+    private static final int PANEL_WIDTH = 360;
+    private static final int PANEL_HEIGHT = 308;
+
+    private static final int COLOR_PANEL = 0xF2111914;
+    private static final int COLOR_HEADER = 0xFF17241B;
+    private static final int COLOR_BORDER = 0xFF405746;
+    private static final int COLOR_FIELD = 0xFF0B130E;
+    private static final int COLOR_FIELD_BORDER = 0xFF34483A;
+    private static final int COLOR_TEXT = 0xFFE3ECE5;
+    private static final int COLOR_MUTED = 0xFF8CA095;
+    private static final int COLOR_DIM = 0xFF6E8576;
+    private static final int COLOR_LIME = 0xFFC9F06D;
+    private static final int COLOR_AMBER = 0xFFE0B066;
+
+    private final ButtonWidget[] fileButtons = new ButtonWidget[FILE_ROWS];
+    private TextFieldWidget originXField;
+    private TextFieldWidget originYField;
+    private TextFieldWidget originZField;
+    private TextFieldWidget chestXField;
+    private TextFieldWidget chestYField;
+    private TextFieldWidget chestZField;
+    private ButtonWidget playButton;
+    private ButtonWidget cameraButton;
+    private ButtonWidget approachButton;
+    private ButtonWidget modeButton;
+    private ButtonWidget eatButton;
+    private ButtonWidget breakButton;
+    private ButtonWidget scaffoldButton;
+    private ButtonWidget chestButton;
+    private TextFieldWidget webhookField;
+    private ButtonWidget previousPageButton;
+    private ButtonWidget nextPageButton;
+    private ButtonWidget reloadButton;
+
+    private int panelX;
+    private int panelY;
+    private int panelW;
+    private int panelH;
+    private int filePage;
+    private String notice = "";
+
+    public AutoBuilderScreen() {
+        super(Text.literal("AutoBuilder"));
+    }
+
+    @Override
+    protected void init() {
+        AutoBuilderConfig config = AutoBuilderClient.config();
+        config.sanitize();
+
+        panelW = Math.min(PANEL_WIDTH, Math.max(280, width - 12));
+        panelH = Math.min(PANEL_HEIGHT, Math.max(240, height - 12));
+        panelX = (width - panelW) / 2;
+        panelY = (height - panelH) / 2;
+
+        int fileX = panelX + 10;
+        int fileW = Math.min(132, Math.max(108, (int) (panelW * 0.35F)));
+        int rightX = fileX + fileW + 10;
+        int rightW = panelX + panelW - 10 - rightX;
+        int fieldGap = 4;
+        int fieldW = (rightW - fieldGap * 2) / 3;
+
+        int listY = panelY + 51;
+        for (int row = 0; row < FILE_ROWS; row++) {
+            final int rowIndex = row;
+            ButtonWidget button = ButtonWidget.builder(
+                    Text.literal("—"),
+                    clicked -> selectFromPage(rowIndex)
+            ).dimensions(fileX, listY + row * 19, fileW, 17).build();
+            fileButtons[row] = button;
+            addDrawableChild(button);
+        }
+
+        int pagerY = listY + FILE_ROWS * 19 + 4;
+        previousPageButton = ButtonWidget.builder(Text.literal("‹"), button -> {
+            if (filePage > 0) {
+                filePage--;
+                refreshFileButtons();
+            }
+        }).dimensions(fileX, pagerY, 24, 16).build();
+        addDrawableChild(previousPageButton);
+
+        reloadButton = ButtonWidget.builder(Text.literal("Quét lại"), button -> {
+            AutoBuilderClient.reloadSchematics();
+            filePage = 0;
+            refreshFileButtons();
+            notice = AutoBuilderClient.loadWarnings().isEmpty()
+                    ? "Đã quét lại · " + AutoBuilderClient.schematics().size() + " tệp"
+                    : "Có " + AutoBuilderClient.loadWarnings().size() + " tệp lỗi";
+            updateButtonLabels();
+        }).dimensions(fileX + 27, pagerY, Math.max(48, fileW - 54), 16).build();
+        addDrawableChild(reloadButton);
+
+        nextPageButton = ButtonWidget.builder(Text.literal("›"), button -> {
+            int maxPage = Math.max(0, (AutoBuilderClient.schematics().size() - 1) / FILE_ROWS);
+            if (filePage < maxPage) {
+                filePage++;
+                refreshFileButtons();
+            }
+        }).dimensions(fileX + fileW - 24, pagerY, 24, 16).build();
+        addDrawableChild(nextPageButton);
+
+        int fieldsY = panelY + 57;
+        int secondFieldsY = fieldsY + 42;
+
+        originXField = addCoordinateField(rightX, fieldsY, fieldW, config.originX);
+        originYField = addCoordinateField(rightX + fieldW + fieldGap, fieldsY, fieldW, config.originY);
+        originZField = addCoordinateField(rightX + (fieldW + fieldGap) * 2, fieldsY, fieldW, config.originZ);
+
+        chestXField = addCoordinateField(rightX, secondFieldsY, fieldW, config.chestX);
+        chestYField = addCoordinateField(rightX + fieldW + fieldGap, secondFieldsY, fieldW, config.chestY);
+        chestZField = addCoordinateField(rightX + (fieldW + fieldGap) * 2, secondFieldsY, fieldW, config.chestZ);
+
+        int toggleY = secondFieldsY + 25;
+        int toggleW = (rightW - 4) / 2;
+        cameraButton = ButtonWidget.builder(Text.literal("Camera"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.autoCamera = !current.autoCamera;
+            updateButtonLabels();
+        }).dimensions(rightX, toggleY, toggleW, 17).build();
+        addDrawableChild(cameraButton);
+
+        approachButton = ButtonWidget.builder(Text.literal("Tới gần"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.autoApproach = !current.autoApproach;
+            updateButtonLabels();
+        }).dimensions(rightX + toggleW + 4, toggleY, rightW - toggleW - 4, 17).build();
+        addDrawableChild(approachButton);
+
+        playButton = ButtonWidget.builder(Text.literal("BẬT TỰ ĐỘNG"), button -> {
+            applyCoordinateFields();
+            MinecraftClient client = MinecraftClient.getInstance();
+            notice = "";
+            AutoBuilderClient.controller().toggle(client);
+            AutoBuilderClient.config().save();
+            updateButtonLabels();
+        }).dimensions(rightX, toggleY + 22, rightW, 20).build();
+        addDrawableChild(playButton);
+
+        // Bước 2 — chế độ Creative / Survival / Auto
+        int modeY = toggleY + 46;
+        modeButton = ButtonWidget.builder(Text.literal("Chế độ"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.mode = switch (current.mode) {
+                case "AUTO" -> "SURVIVAL";
+                case "SURVIVAL" -> "CREATIVE";
+                default -> "AUTO";
+            };
+            updateButtonLabels();
+        }).dimensions(rightX, modeY, rightW, 16).build();
+        addDrawableChild(modeButton);
+
+        // Bước 2 — các công tắc treo máy
+        int toggles2Y = modeY + 19;
+        int toggles3Y = toggles2Y + 19;
+        eatButton = ButtonWidget.builder(Text.literal("Tự ăn"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.autoEat = !current.autoEat;
+            updateButtonLabels();
+        }).dimensions(rightX, toggles2Y, toggleW, 16).build();
+        addDrawableChild(eatButton);
+
+        breakButton = ButtonWidget.builder(Text.literal("Đập sai"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.breakWrongBlocks = !current.breakWrongBlocks;
+            updateButtonLabels();
+        }).dimensions(rightX + toggleW + 4, toggles2Y, rightW - toggleW - 4, 16).build();
+        addDrawableChild(breakButton);
+
+        scaffoldButton = ButtonWidget.builder(Text.literal("Giàn giáo"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.autoScaffold = !current.autoScaffold;
+            updateButtonLabels();
+        }).dimensions(rightX, toggles3Y, toggleW, 16).build();
+        addDrawableChild(scaffoldButton);
+
+        chestButton = ButtonWidget.builder(Text.literal("Rương đồ"), button -> {
+            AutoBuilderConfig current = AutoBuilderClient.config();
+            current.useChest = !current.useChest;
+            updateButtonLabels();
+        }).dimensions(rightX + toggleW + 4, toggles3Y, rightW - toggleW - 4, 16).build();
+        addDrawableChild(chestButton);
+
+        // Bước 2 — Webhook Discord (để trống = tắt)
+        int webhookFieldY = toggles3Y + 25;
+        webhookField = new TextFieldWidget(
+                textRenderer,
+                rightX + 3,
+                webhookFieldY + 1,
+                Math.max(40, rightW - 6),
+                15,
+                Text.literal("")
+        );
+        webhookField.setMaxLength(150);
+        webhookField.setText(config.webhookUrl);
+        webhookField.setDrawsBackground(false);
+        addDrawableChild(webhookField);
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("×"), button -> close())
+                .dimensions(panelX + panelW - 23, panelY + 7, 16, 15).build());
+
+        // Mở đúng trang chứa bản vẽ đang được lưu trong config.
+        filePage = 0;
+        for (int index = 0; index < AutoBuilderClient.schematics().size(); index++) {
+            if (AutoBuilderClient.schematics().get(index).fileName().equals(config.selectedSchematic)) {
+                filePage = index / FILE_ROWS;
+                break;
+            }
+        }
+
+        refreshFileButtons();
+        updateButtonLabels();
+    }
+
+    private TextFieldWidget addCoordinateField(int x, int y, int width, int value) {
+        TextFieldWidget field = new TextFieldWidget(
+                textRenderer,
+                x + 3,
+                y + 1,
+                Math.max(20, width - 6),
+                15,
+                Text.literal("0")
+        );
+        field.setMaxLength(10);
+        field.setText(String.valueOf(value));
+        field.setTextPredicate(raw -> raw.matches("-?\\d*"));
+        field.setDrawsBackground(false);
+        addDrawableChild(field);
+        return field;
+    }
+
+    private void selectFromPage(int row) {
+        List<Schematic> schematics = AutoBuilderClient.schematics();
+        int index = filePage * FILE_ROWS + row;
+        if (index < 0 || index >= schematics.size()) {
+            return;
+        }
+        AutoBuilderClient.selectSchematic(schematics.get(index));
+        notice = "Đã chọn · " + schematics.get(index).fileName();
+        refreshFileButtons();
+        updateButtonLabels();
+        AutoBuilderClient.config().save();
+    }
+
+    private void refreshFileButtons() {
+        List<Schematic> schematics = AutoBuilderClient.schematics();
+        int maxPage = Math.max(0, (schematics.size() - 1) / FILE_ROWS);
+        filePage = Math.max(0, Math.min(filePage, maxPage));
+
+        AutoBuilderConfig config = AutoBuilderClient.config();
+        for (int row = 0; row < FILE_ROWS; row++) {
+            int index = filePage * FILE_ROWS + row;
+            ButtonWidget button = fileButtons[row];
+            if (button == null) {
+                continue;
+            }
+            if (index >= schematics.size()) {
+                button.setMessage(Text.literal("—"));
+                button.active = false;
+                continue;
+            }
+            Schematic schematic = schematics.get(index);
+            boolean selected = schematic.fileName().equals(config.selectedSchematic);
+            button.active = true;
+            button.setMessage(Text.literal((selected ? "▸ " : "  ") + shorten(schematic.fileName(), 17)));
+        }
+
+        if (previousPageButton != null) {
+            previousPageButton.active = filePage > 0;
+        }
+        if (nextPageButton != null) {
+            nextPageButton.active = filePage < maxPage;
+        }
+        if (reloadButton != null) {
+            reloadButton.active = true;
+        }
+    }
+
+    private void updateButtonLabels() {
+        AutoBuilderConfig config = AutoBuilderClient.config();
+        boolean enabled = AutoBuilderClient.controller().isEnabled();
+
+        if (playButton != null) {
+            playButton.setMessage(Text.literal(enabled ? "TẮT TỰ ĐỘNG" : "BẬT TỰ ĐỘNG"));
+        }
+        if (cameraButton != null) {
+            cameraButton.setMessage(Text.literal("Camera: " + (config.autoCamera ? "MƯỢT" : "TẮT")));
+        }
+        if (approachButton != null) {
+            approachButton.setMessage(Text.literal("Tới gần: " + (config.autoApproach ? "BẬT" : "TẮT")));
+        }
+        if (modeButton != null) {
+            String label = switch (config.mode) {
+                case "CREATIVE" -> "Chế độ: CREATIVE";
+                case "SURVIVAL" -> "Chế độ: SURVIVAL";
+                default -> "Chế độ: AUTO (theo game)";
+            };
+            modeButton.setMessage(Text.literal(label));
+        }
+        if (eatButton != null) {
+            eatButton.setMessage(Text.literal("Tự ăn: " + (config.autoEat ? "BẬT" : "TẮT")));
+        }
+        if (breakButton != null) {
+            breakButton.setMessage(Text.literal("Đập sai: " + (config.breakWrongBlocks ? "BẬT" : "TẮT")));
+        }
+        if (scaffoldButton != null) {
+            scaffoldButton.setMessage(Text.literal("Giàn giáo: " + (config.autoScaffold ? "BẬT" : "TẮT")));
+        }
+        if (chestButton != null) {
+            chestButton.setMessage(Text.literal("Rương đồ: " + (config.useChest ? "BẬT" : "TẮT")));
+        }
+    }
+
+    private void applyCoordinateFields() {
+        AutoBuilderConfig config = AutoBuilderClient.config();
+        config.originX = parseField(originXField, config.originX);
+        config.originY = parseField(originYField, config.originY);
+        config.originZ = parseField(originZField, config.originZ);
+        config.chestX = parseField(chestXField, config.chestX);
+        config.chestY = parseField(chestYField, config.chestY);
+        config.chestZ = parseField(chestZField, config.chestZ);
+        if (webhookField != null) {
+            config.webhookUrl = webhookField.getText().trim();
+        }
+        config.sanitize();
+    }
+
+    private int parseField(TextFieldWidget field, int fallback) {
+        if (field == null) {
+            return fallback;
+        }
+        String text = field.getText().trim();
+        if (text.isEmpty() || text.equals("-")) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    @Override
+    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+        context.fill(0, 0, width, height, 0x8A020705);
+
+        // Panel + viền phẳng 1px. Không gradient, không texture, không khối 3D.
+        context.fill(panelX, panelY, panelX + panelW, panelY + panelH, COLOR_PANEL);
+        context.fill(panelX, panelY, panelX + panelW, panelY + 1, COLOR_BORDER);
+        context.fill(panelX, panelY + panelH - 1, panelX + panelW, panelY + panelH, COLOR_BORDER);
+        context.fill(panelX, panelY, panelX + 1, panelY + panelH, COLOR_BORDER);
+        context.fill(panelX + panelW - 1, panelY, panelX + panelW, panelY + panelH, COLOR_BORDER);
+        context.fill(panelX + 1, panelY + 1, panelX + panelW - 1, panelY + 33, COLOR_HEADER);
+
+        context.drawText(textRenderer, "AUTOBUILDER", panelX + 25, panelY + 12, COLOR_TEXT, false);
+        context.drawText(textRenderer, "2.0.0", panelX + 108, panelY + 12, COLOR_DIM, false);
+        context.fill(panelX + 11, panelY + 11, panelX + 20, panelY + 20, COLOR_LIME);
+        context.drawText(textRenderer, "A", panelX + 14, panelY + 12, 0xFF102016, false);
+
+        int fileX = panelX + 10;
+        int fileW = Math.min(132, Math.max(108, (int) (panelW * 0.35F)));
+        int rightX = fileX + fileW + 10;
+        int rightW = panelX + panelW - 10 - rightX;
+        int fieldGap = 4;
+        int fieldW = (rightW - fieldGap * 2) / 3;
+        int fieldsY = panelY + 57;
+        int secondFieldsY = fieldsY + 42;
+
+        context.drawText(textRenderer, "BẢN VẼ", fileX, panelY + 39, COLOR_MUTED, false);
+        context.drawText(textRenderer,
+                String.valueOf(AutoBuilderClient.schematics().size()),
+                fileX + fileW - textRenderer.getWidth(String.valueOf(AutoBuilderClient.schematics().size())),
+                panelY + 39,
+                COLOR_LIME,
+                false
+        );
+
+        int infoY = panelY + 157;
+        Schematic selected = AutoBuilderClient.selectedSchematic();
+        if (selected == null) {
+            context.drawText(textRenderer, "Chưa có tệp trong schematics/", fileX, infoY, COLOR_AMBER, false);
+            String directory = AutoBuilderClient.schematicsDirectory().toString();
+            context.drawText(textRenderer, shorten(directory, 24), fileX, infoY + 11, COLOR_DIM, false);
+        } else {
+            context.drawText(textRenderer, selected.shortFormatLabel(), fileX, infoY, COLOR_TEXT, false);
+            context.drawText(textRenderer, selected.dimensionsLabel(), fileX, infoY + 10, COLOR_DIM, false);
+            context.drawText(textRenderer, selected.blocks() + " block không-air", fileX, infoY + 20, COLOR_DIM, false);
+
+            // Bước 2 — ghi chú bản vẽ (ví dụ vị trí nước/lava phải đặt tay).
+            if (!selected.notes().isEmpty()) {
+                int noteY = infoY + 34;
+                int noteIndex = 0;
+                for (String note : selected.notes()) {
+                    if (noteIndex >= 2 || noteY > panelY + panelH - 42) {
+                        break;
+                    }
+                    context.drawText(textRenderer, shorten("• " + note, 27), fileX, noteY, COLOR_AMBER, false);
+                    noteY += 10;
+                    noteIndex++;
+                }
+            }
+        }
+
+        drawSectionLabel(context, "GÓC BẮT ĐẦU", rightX, rightW, panelY + 39, "XYZ");
+        drawFieldLabel(context, "X", rightX, fieldsY);
+        drawFieldLabel(context, "Y", rightX + fieldW + fieldGap, fieldsY);
+        drawFieldLabel(context, "Z", rightX + (fieldW + fieldGap) * 2, fieldsY);
+        drawFieldBackground(context, rightX, fieldsY, fieldW);
+        drawFieldBackground(context, rightX + fieldW + fieldGap, fieldsY, fieldW);
+        drawFieldBackground(context, rightX + (fieldW + fieldGap) * 2, fieldsY, fieldW);
+
+        drawSectionLabel(context, "RƯƠNG ĐỒ", rightX, rightW, secondFieldsY - 23, "chỉ lưu");
+        drawFieldLabel(context, "X", rightX, secondFieldsY);
+        drawFieldLabel(context, "Y", rightX + fieldW + fieldGap, secondFieldsY);
+        drawFieldLabel(context, "Z", rightX + (fieldW + fieldGap) * 2, secondFieldsY);
+        drawFieldBackground(context, rightX, secondFieldsY, fieldW);
+        drawFieldBackground(context, rightX + fieldW + fieldGap, secondFieldsY, fieldW);
+        drawFieldBackground(context, rightX + (fieldW + fieldGap) * 2, secondFieldsY, fieldW);
+
+        // Bước 2 — nhãn webhook + nền ô nhập.
+        int toggleYDraw = secondFieldsY + 23;
+        int modeYDraw = toggleYDraw + 46;
+        int toggles3YDraw = modeYDraw + 38;
+        int webhookFieldYDraw = toggles3YDraw + 25;
+        context.drawText(textRenderer, "WEBHOOK DISCORD", rightX, webhookFieldYDraw - 9, COLOR_MUTED, false);
+        context.drawText(textRenderer, "để trống = tắt",
+                rightX + rightW - textRenderer.getWidth("để trống = tắt"),
+      
