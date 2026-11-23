@@ -1,0 +1,587 @@
+package com.autobuilder.client;
+
+import com.autobuilder.AutoBuilder;
+import com.autobuilder.AutoBuilderClient;
+import com.autobuilder.config.AutoBuilderConfig;
+import com.autobuilder.schematic.BlockStateParser;
+import com.autobuilder.schematic.Schematic;
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
+
+import java.util.BitSet;
+import java.util.Locale;
+
+/**
+ * Bộ điều khiển xây — BƯỚC 2 (treo máy AFK).
+ *
+ * Tính năng bước 2:
+ * 1. Chế độ CREATIVE / SURVIVAL / AUTO:
+ *    - Creative: tự lấy block từ kho sáng tạo (clickCreativeStack).
+ *    - Survival: hết block -> lưu vị trí, chạy về rương đã cấu hình,
+ *      QUICK_MOVE đúng loại block thiếu, quay lại xây tiếp.
+ * 2. Anti-stuck: kẹt 3 giây -> nhảy; 6 giây -> đi vòng vuông góc;
+ *    15 giây -> webhook + bỏ qua chặng di chuyển đó (mod VẪN BẬT).
+ *    Block đặt sai vị trí/sai loại bị đập bỏ (creative đập ngay,
+ *    survival đào từ từ tối đa 5 giây rồi bỏ qua).
+ * 3. Xây tầng cao: tự bắc scaffolding khi mục tiêu cao hơn 3 block.
+ *    Thứ tự xây đã được Schematic.sortByBuildOrder sắp "dưới lên trên,
+ *    trong ra ngoài". Chất lỏng (nước/lava/bubble column) TUYỆT ĐỐI
+ *    không đặt — đánh dấu xong và đếm riêng.
+ * 4. Tự ăn khi đói (data component FOOD), hiển thị số block còn lại
+ *    trên action bar mỗi giây, tự tắt khi đạt 100%.
+ *
+ * "Không tự động tắt khi đang xây": lỗi tạm thời (thiếu đồ, ngoài tầm với,
+ * kẹt địa hình, màn hình đang mở) chỉ TẠM DỪNG rồi thử lại. Mod chỉ tắt khi:
+ * (a) hoàn thành 100%, (b) người chơi tắt thủ công, (c) rời thế giới.
+ *
+ * Nguyên tắc an toàn giữ nguyên từ bước 1: không cheat packet, không phá
+ * block ngoài schematic (trừ block đặt sai tại ô mục tiêu), mọi thao tác
+ * qua interactionManager như người chơi thật.
+ */
+public final class BuildController {
+    private static final double MAX_REACH = 4.3;
+    private static final double STEP_DISTANCE = 0.16;
+    private static final double STOP_DISTANCE = 2.4;
+    private static final double CHEST_STOP_DISTANCE = 2.6;
+    private static final double RETURN_STOP_DISTANCE = 1.2;
+
+    // Anti-stuck: 20 tick = 1 giây
+    private static final int STUCK_JUMP_TICKS = 60;
+    private static final int STUCK_DETOUR_TICKS = 120;
+    private static final int STUCK_GIVEUP_TICKS = 300;
+
+    // Các pha lấy đồ từ rương
+    private static final int RESUPPLY_NONE = 0;
+    private static final int RESUPPLY_WALK_TO_CHEST = 1;
+    private static final int RESUPPLY_OPEN_CHEST = 2;
+    private static final int RESUPPLY_RETURN = 3;
+
+    // Trạng thái xây
+    private Schematic schematic;
+    private BitSet done = new BitSet();
+    private boolean enabled;
+    private int placed;
+    private int skipped;
+    private int liquidSkipped;
+    private int tickCooldown;
+    private int warningCooldown;
+    private int overlayCooldown;
+    private BlockPos currentTarget;
+    private String status = "Chưa bật";
+
+    // Đập block đặt sai (survival cần thời gian đào)
+    private BlockPos breakingPos;
+    private int breakingIndex = -1;
+    private int breakingTicks;
+
+    // Lấy đồ từ rương
+    private int resupplyPhase = RESUPPLY_NONE;
+    private Vec3d resumePos;
+    private Item resupplyItem;
+    private int resupplyWaitTicks;
+    private int noMaterialNoticeTicks;
+
+    // Anti-stuck
+    private Vec3d lastPos = Vec3d.ZERO;
+    private int stuckTicks;
+    private int detourTicks;
+    private Vec3d detourDir = Vec3d.ZERO;
+    private boolean expectMovement;
+    private boolean stuckWebhookSent;
+
+    // Tự ăn
+    private boolean eating;
+    private int eatTicks;
+
+    // Giàn giáo
+    private int scaffoldCooldown;
+
+    public void setSchematic(Schematic schematic) {
+        this.schematic = schematic;
+        this.done = new BitSet(schematic == null ? 0 : schematic.blocks());
+        this.enabled = false;
+        this.placed = 0;
+        this.skipped = 0;
+        this.liquidSkipped = 0;
+        this.currentTarget = null;
+        this.tickCooldown = 0;
+        this.breakingPos = null;
+        this.breakingIndex = -1;
+        this.resupplyPhase = RESUPPLY_NONE;
+        this.resumePos = null;
+        this.resupplyItem = null;
+        this.stuckTicks = 0;
+        this.detourTicks = 0;
+        this.status = schematic == null
+                ? "Chưa chọn bản vẽ"
+                : "Sẵn sàng · " + schematic.blocks() + " block";
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public String status() {
+        return status;
+    }
+
+    public int placed() {
+        return placed;
+    }
+
+    public int skipped() {
+        return skipped;
+    }
+
+    public int liquidSkipped() {
+        return liquidSkipped;
+    }
+
+    public boolean isResupplying() {
+        return resupplyPhase != RESUPPLY_NONE;
+    }
+
+    public BlockPos currentTarget() {
+        return currentTarget;
+    }
+
+    public double progress() {
+        int total = schematic == null ? 0 : schematic.blocks();
+        if (total == 0 || done == null) {
+            return 0.0;
+        }
+        return Math.min(1.0, (double) done.cardinality() / total);
+    }
+
+    public int remaining() {
+        int total = schematic == null ? 0 : schematic.blocks();
+        return Math.max(0, total - done.cardinality());
+    }
+
+    public boolean toggle(MinecraftClient client) {
+        if (enabled) {
+            stop(client, "Đã tắt thủ công");
+            return false;
+        }
+        return start(client);
+    }
+
+    public boolean start(MinecraftClient client) {
+        if (client.player == null || client.world == null) {
+            status = "Chưa vào thế giới";
+            return false;
+        }
+        if (schematic == null || schematic.blocks() == 0) {
+            status = "Chưa chọn bản vẽ hợp lệ";
+            announce(client, status);
+            return false;
+        }
+
+        AutoBuilderConfig config = AutoBuilderClient.config();
+        config.sanitize();
+        done = new BitSet(schematic.blocks());
+        placed = 0;
+        skipped = 0;
+        liquidSkipped = 0;
+        tickCooldown = 0;
+        warningCooldown = 0;
+        overlayCooldown = 0;
+        currentTarget = null;
+        breakingPos = null;
+        breakingIndex = -1;
+        resupplyPhase = RESUPPLY_NONE;
+        resumePos = null;
+        resupplyItem = null;
+        stuckTicks = 0;
+        detourTicks = 0;
+        stuckWebhookSent = false;
+        eating = false;
+        enabled = true;
+        status = "Đang xây · " + schematic.fileName();
+        announce(client, "AutoBuilder bật · " + schematic.blocks() + " block · chế độ " + modeLabel(client));
+        AutoBuilderClient.webhook("🏗️ AutoBuilder bắt đầu '" + schematic.fileName() + "' ("
+                + schematic.blocks() + " block) tại " + config.originX + " " + config.originY + " " + config.originZ);
+        AutoBuilder.LOGGER.info("Build started: {} (mode {})", schematic.fileName(), config.mode);
+        return true;
+    }
+
+    public void stop(MinecraftClient client, String reason) {
+        if (enabled) {
+            AutoBuilder.LOGGER.info("Build stopped: {} ({})", schematic == null ? "-" : schematic.fileName(), reason);
+        }
+        enabled = false;
+        stopEating(client);
+        resupplyPhase = RESUPPLY_NONE;
+        resumePos = null;
+        resupplyItem = null;
+        breakingPos = null;
+        breakingIndex = -1;
+        expectMovement = false;
+        status = reason;
+    }
+
+    /**
+     * Được gọi ở END_CLIENT_TICK.
+     */
+    public void tick(MinecraftClient client) {
+        if (!enabled) {
+            return;
+        }
+        if (client.player == null || client.world == null) {
+            stop(client, "Thế giới chưa sẵn sàng");
+            return;
+        }
+        // Màn hình đang mở: tạm dừng. Ngoại lệ duy nhất là màn hình rương
+        // do chính luồng resupply mở ra.
+        if (client.currentScreen != null && resupplyPhase != RESUPPLY_OPEN_CHEST) {
+            return;
+        }
+        if (warningCooldown > 0) {
+            warningCooldown--;
+        }
+        if (overlayCooldown > 0) {
+            overlayCooldown--;
+        }
+        if (scaffoldCooldown > 0) {
+            scaffoldCooldown--;
+        }
+        if (noMaterialNoticeTicks > 0) {
+            noMaterialNoticeTicks--;
+        }
+
+        updateOverlay(client);
+        updateStuckDetection(client);
+
+        // Tự ăn được ưu tiên cao nhất.
+        if (handleEating(client)) {
+            tickCooldown = 2;
+            return;
+        }
+
+        if (tickCooldown > 0) {
+            tickCooldown--;
+            if (currentTarget != null
+                    && AutoBuilderClient.config().autoCamera
+                    && resupplyPhase == RESUPPLY_NONE) {
+                lookAt(client.player, Vec3d.ofCenter(currentTarget));
+            }
+            return;
+        }
+
+        AutoBuilderConfig config = AutoBuilderClient.config();
+
+        switch (resupplyPhase) {
+            case RESUPPLY_WALK_TO_CHEST -> {
+                walkToChest(client, config);
+                return;
+            }
+            case RESUPPLY_OPEN_CHEST -> {
+                handleChestScreen(client, config);
+                return;
+            }
+            case RESUPPLY_RETURN -> {
+                walkBack(client);
+                return;
+            }
+            default -> {
+            }
+        }
+
+        buildTick(client, config);
+    }
+
+    // ------------------------------------------------------------------
+    // Vòng lặp xây chính
+    // ------------------------------------------------------------------
+
+    private void buildTick(MinecraftClient client, AutoBuilderConfig config) {
+        ClientPlayerEntity player = client.player;
+        boolean creative = isCreativeMode(client);
+
+        int nextIndex = findNextPlaceable(client, config, creative);
+        if (nextIndex == -2) {
+            // Đang đập block đặt sai — chờ.
+            tickCooldown = 1;
+            return;
+        }
+        if (nextIndex < 0) {
+            complete(client);
+            return;
+        }
+
+        Schematic.Target target = schematic.targets().get(nextIndex);
+        BlockPos worldPos = toWorld(target, config);
+        currentTarget = worldPos;
+
+        // Tuyến phòng thủ thứ hai: không bao giờ đặt chất lỏng.
+        if (BlockStateParser.isLiquidState(target.state())) {
+            done.set(nextIndex);
+            liquidSkipped++;
+            status = "Bỏ qua chất lỏng · còn " + remaining() + " block";
+            return;
+        }
+
+        BlockState desired = BlockStateParser.parse(target.state());
+        if (config.autoCamera) {
+            lookAt(player, Vec3d.ofCenter(worldPos));
+        }
+
+        double distance = player.getEyePos().distanceTo(Vec3d.ofCenter(worldPos));
+        if (distance > MAX_REACH) {
+            if (config.autoApproach) {
+                expectMovement = true;
+                boolean moved = stepToward(client, worldPos, STOP_DISTANCE);
+                status = moved
+                        ? "Đang tới gần · còn " + remaining() + " block"
+                        : "Đang tìm đường tới gần";
+                tickCooldown = 1;
+            } else {
+                expectMovement = false;
+                status = "Ngoài tầm với — bật 'Tới gần' hoặc tự bước lại";
+                warnThrottled(client, status);
+                tickCooldown = 10;
+            }
+            return;
+        }
+        expectMovement = false;
+
+        // Xây trên cao: tự bắc giàn giáo.
+        if (config.autoScaffold && worldPos.getY() > player.getY() + 3.0) {
+            if (scaffoldUp(client)) {
+                tickCooldown = 2;
+            } else {
+                status = "Cần item scaffolding trong hotbar để xây cao";
+                warnThrottled(client, status);
+                tickCooldown = 20;
+            }
+            return;
+        }
+
+        if (!ensureItem(client, desired, creative)) {
+            if (!creative && config.resupplyFromChest && config.useChest) {
+                startResupply(client, desired.getBlock().asItem());
+            } else if (!creative && config.resupplyFromChest && !config.useChest) {
+                status = "Thiếu block · " + desired.getBlock().getName().getString() + " · chưa bật toạ độ rương";
+                if (noMaterialNoticeTicks <= 0) {
+                    AutoBuilderClient.webhook("📦 AutoBuilder hết '"
+                            + desired.getBlock().getName().getString() + "' và chưa cấu hình rương đồ.");
+                    noMaterialNoticeTicks = 600;
+                }
+                warnThrottled(client, status);
+                tickCooldown = 20;
+            } else {
+                status = creative
+                        ? "Creative: không lấy được item này"
+                        : "Thiếu block · " + desired.getBlock().getName().getString();
+                warnThrottled(client, status);
+                tickCooldown = 20;
+            }
+            // KHÔNG tắt mod: tạm dừng, chờ người chơi bổ sung vật liệu.
+            return;
+        }
+
+        if (placeAt(client, worldPos)) {
+            done.set(nextIndex);
+            placed++;
+            tickCooldown = config.placeDelayTicks;
+            status = placed + " đã đặt · còn " + remaining() + " block";
+            if (done.cardinality() >= schematic.blocks()) {
+                complete(client);
+            }
+        } else {
+            status = "Chưa đặt được · đang tìm mặt đỡ khác";
+            tickCooldown = 8;
+        }
+    }
+
+    /**
+     * Tìm block tiếp theo. Trả về:
+     * - index >= 0: block cần đặt;
+     * - -1: hết việc (hoàn thành);
+     * - -2: đang bận đập block đặt sai.
+     */
+    private int findNextPlaceable(MinecraftClient client, AutoBuilderConfig config, boolean creative) {
+        World world = client.world;
+        if (world == null) {
+            return -1;
+        }
+
+        while (true) {
+            if (breakingPos != null) {
+                int breaking = continueBreaking(client, creative);
+                if (breaking != 0) {
+                    return breaking;
+                }
+                // Đập xong — vòng lặp chọn block kế tiếp.
+            }
+
+            int candidate = done.nextClearBit(0);
+            if (candidate >= schematic.blocks()) {
+                return -1;
+            }
+
+            Schematic.Target target = schematic.targets().get(candidate);
+            BlockPos pos = toWorld(target, config);
+
+            // Chất lỏng được xử lý ở buildTick (đánh dấu bỏ qua).
+            if (BlockStateParser.isLiquidState(target.state())) {
+                return candidate;
+            }
+
+            BlockState current = world.getBlockState(pos);
+            BlockState desired = BlockStateParser.parse(target.state());
+
+            if (current.getBlock() == desired.getBlock()) {
+                done.set(candidate);
+                continue;
+            }
+            if (current.isReplaceable()) {
+                return candidate;
+            }
+
+            // Ô mục tiêu đang bị chiếm bởi block KHÁC loại — block đặt sai.
+            if (!config.breakWrongBlocks) {
+                done.set(candidate);
+                skipped++;
+                continue;
+            }
+            if (creative) {
+                if (client.interactionManager != null) {
+                    client.interactionManager.attackBlock(pos, Direction.UP);
+                    breakingPos = pos;
+                    breakingIndex = candidate;
+                    breakingTicks = 0;
+                    status = "Đập block đặt sai tại " + pos.toShortString();
+                } else {
+                    done.set(candidate);
+                    skipped++;
+                }
+                return -2;
+            }
+            breakingPos = pos;
+            breakingIndex = candidate;
+            breakingTicks = 0;
+            status = "Đang đào block đặt sai tại " + pos.toShortString();
+            return -2;
+        }
+    }
+
+    /**
+     * Tiếp tục đào block sai. Trả về 0 khi xong, -2 khi còn bận.
+     * Quá 100 tick (5 giây) thì huỷ và bỏ qua block đó.
+     */
+    private int continueBreaking(MinecraftClient client, boolean creative) {
+        World world = client.world;
+        if (world == null || client.interactionManager == null || breakingPos == null) {
+            breakingPos = null;
+            breakingIndex = -1;
+            return 0;
+        }
+
+        BlockState state = world.getBlockState(breakingPos);
+        if (state.isAir() || state.isReplaceable()) {
+            client.interactionManager.cancelBlockBreaking();
+            breakingPos = null;
+            breakingIndex = -1;
+            status = "Đã đập xong block đặt sai";
+            return 0;
+        }
+
+        breakingTicks++;
+        if (breakingTicks > 100) {
+            client.interactionManager.cancelBlockBreaking();
+            if (breakingIndex >= 0) {
+                done.set(breakingIndex);
+                skipped++;
+            }
+            breakingPos = null;
+            breakingIndex = -1;
+            status = "Không đào được — bỏ qua block này";
+            return 0;
+        }
+
+        if (!creative) {
+            client.interactionManager.updateBlockBreakingProgress(breakingPos, Direction.UP);
+        } else if (breakingTicks % 5 == 0) {
+            client.interactionManager.attackBlock(breakingPos, Direction.UP);
+        }
+        return -2;
+    }
+
+    private BlockPos toWorld(Schematic.Target target, AutoBuilderConfig config) {
+        return new BlockPos(
+                config.originX + target.x(),
+                config.originY + target.y(),
+                config.originZ + target.z()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Vật liệu: Creative / Survival / rương
+    // ------------------------------------------------------------------
+
+    private boolean isCreativeMode(MinecraftClient client) {
+        String mode = AutoBuilderClient.config().mode;
+        if ("CREATIVE".equals(mode)) {
+            return true;
+        }
+        if ("SURVIVAL".equals(mode)) {
+            return false;
+        }
+        return client.player != null && client.player.isCreative();
+    }
+
+    private String modeLabel(MinecraftClient client) {
+        return isCreativeMode(client) ? "Creative" : "Survival";
+    }
+
+    /**
+     * Đảm bảo hotbar đang chọn đúng item cần đặt.
+     * Creative: tự cấp từ kho sáng tạo. Survival: lục 36 ô túi rồi
+     * SWAP vào hotbar bằng packet hợp lệ.
+     */
+    private boolean ensureItem(MinecraftClient client, BlockState desired, boolean creative) {
+        ClientPlayerEntity player = client.player;
+        if (player == null) {
+            return false;
+        }
+        Item wanted = desired.getBlock().asItem();
+        if (wanted == Items.AIR) {
+            return false;
+        }
+
+        PlayerInventory inventory = player.getInventory();
+        int selected = inventory.getSelectedSlot();
+        if (selected >= 0 && selected < 9
+                && inventory.getStack(selected).getItem() == wanted) {
+            return true;
+        }
+
+        int foundSlot = -1;
+        for (int slot = 0; slot < 36; slot++) {
+            if (inventory.getStack(slot).getItem() == wanted) {
+                foundSlot = slot;
+                break;
+            }
+        }
+
+        if (foundSlot == -1) {
+            if (creative && client.interactionManager != null) {
+                int targetSlot = selected >= 0 
