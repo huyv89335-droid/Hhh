@@ -1,0 +1,15 @@
+{
+  "key.categories.autobuilder": "AutoBuilder",
+  "key.category.autobuilder.main": "AutoBuilder",
+  "key.categories.autobuilder.main": "AutoBuilder",
+  "key.autobuilder.open": "Mở AutoBuilder",
+  "text.autobuilder.title": "AutoBuilder",
+  "text.autobuilder.ready": "Sẵn sàng",
+  "text.autobuilder.building": "Đang xây",
+  "text.autobuilder.paused": "Tạm dừng",
+  "text.autobuilder.complete": "Hoàn tất",
+  "text.autobuilder.resupply": "Đang lấy block từ rương",
+  "text.autobuilder.eating": "Đang ăn",
+  "text.autobuilder.stuck": "Bị kẹt — đang tự thoát",
+  "text.autobuilder.webhook_sent": "Đã gửi webhook Discord"
+}
