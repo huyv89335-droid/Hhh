@@ -1,0 +1,365 @@
+package com.autobuilder.schematic;
+
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtElement;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtSizeTracker;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.stream.Stream;
+
+/**
+ * Đọc bản vẽ cục bộ từ thư mục schematics.
+ *
+ * An toàn:
+ * - không tải toàn bộ thế giới, chỉ giữ block không-air;
+ * - tối đa MAX_BLOCKS block không-air;
+ * - tối đa MAX_VOLUME ô mỗi region;
+ * - lỗi ở một tệp không làm hỏng danh sách tệp khác.
+ */
+public final class SchematicLoader {
+    public static final int MAX_BLOCKS = 25_000;
+    private static final long MAX_VOLUME = 4_000_000L;
+    private static final long MAX_NBT_BYTES = 256L * 1024L * 1024L;
+
+    private SchematicLoader() {
+    }
+
+    public record LoadResult(List<Schematic> schematics, List<String> warnings, Path directory) {
+    }
+
+    public static LoadResult loadAll() {
+        Path directory = FabricLoader.getInstance().getGameDir().resolve("schematics");
+        List<Schematic> schematics = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+
+        try {
+            Files.createDirectories(directory);
+        } catch (IOException exception) {
+            warnings.add("Không tạo được thư mục schematics: " + exception.getMessage());
+            return new LoadResult(List.of(), List.copyOf(warnings), directory);
+        }
+
+        List<Path> files;
+        try (Stream<Path> stream = Files.list(directory)) {
+            files = stream
+                    .filter(Files::isRegularFile)
+                    .filter(SchematicLoader::isSupported)
+                    .sorted(Comparator.comparing(path -> path.getFileName().toString().toLowerCase(Locale.ROOT)))
+                    .toList();
+        } catch (IOException exception) {
+            warnings.add("Không đọc được thư mục schematics: " + exception.getMessage());
+            return new LoadResult(List.of(), List.copyOf(warnings), directory);
+        }
+
+        for (Path path : files) {
+            try {
+                NbtCompound root = NbtIo.readCompressed(path, NbtSizeTracker.of(MAX_NBT_BYTES));
+                Schematic schematic = isLitematic(path)
+                        ? readLitematic(path, root)
+                        : readSponge(path, root);
+                schematics.add(schematic);
+            } catch (Exception exception) {
+                String fileName = path.getFileName().toString();
+                warnings.add(fileName + ": " + safeMessage(exception));
+                com.autobuilder.AutoBuilder.LOGGER.warn("Schematic load failed: {}", path, exception);
+            }
+        }
+
+        return new LoadResult(List.copyOf(schematics), List.copyOf(warnings), directory);
+    }
+
+    public static boolean isSupported(Path path) {
+        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".litematic") || name.endsWith(".schem");
+    }
+
+    private static boolean isLitematic(Path path) {
+        return path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic");
+    }
+
+    private static Schematic readLitematic(Path path, NbtCompound root) {
+        NbtCompound regions = root.getCompound("Regions");
+        if (regions.isEmpty()) {
+            throw new IllegalArgumentException("không tìm thấy compound Regions");
+        }
+
+        // Dùng key theo toạ độ để region chồng lên nhau không tạo block trùng.
+        Map<String, Schematic.Target> unique = new LinkedHashMap<>();
+
+        for (String regionName : regions.getKeys()) {
+            if (unique.size() >= MAX_BLOCKS) {
+                break;
+            }
+
+            NbtCompound region = regions.getCompound(regionName);
+            NbtCompound position = region.getCompound("Position");
+            NbtCompound size = region.getCompound("Size");
+
+            int rawSizeX = size.getInt("x");
+            int rawSizeY = size.getInt("y");
+            int rawSizeZ = size.getInt("z");
+            int sizeX = Math.abs(rawSizeX);
+            int sizeY = Math.abs(rawSizeY);
+            int sizeZ = Math.abs(rawSizeZ);
+
+            if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0) {
+                continue;
+            }
+
+            long volume = (long) sizeX * sizeY * sizeZ;
+            if (volume > MAX_VOLUME) {
+                com.autobuilder.AutoBuilder.LOGGER.warn(
+                        "Region {} trong {} có {} ô, vượt giới hạn {}. Bỏ qua.",
+                        regionName, path.getFileName(), volume, MAX_VOLUME
+                );
+                continue;
+            }
+
+            List<String> palette = new ArrayList<>();
+            NbtList paletteList = region.getList("BlockStatePalette", NbtElement.COMPOUND_TYPE);
+            for (int i = 0; i < paletteList.size(); i++) {
+                palette.add(paletteEntryToState(paletteList.getCompound(i)));
+            }
+            if (palette.isEmpty()) {
+                continue;
+            }
+
+            long[] packedStates = region.getLongArray("BlockStates");
+            if (packedStates.length == 0) {
+                continue;
+            }
+
+            int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(Math.max(1, palette.size() - 1)));
+            int positionX = position.getInt("x");
+            int positionY = position.getInt("y");
+            int positionZ = position.getInt("z");
+
+            for (int y = 0; y < sizeY && unique.size() < MAX_BLOCKS; y++) {
+                for (int z = 0; z < sizeZ && unique.size() < MAX_BLOCKS; z++) {
+                    for (int x = 0; x < sizeX && unique.size() < MAX_BLOCKS; x++) {
+                        int index = (y * sizeZ + z) * sizeX + x;
+                        int paletteIndex = readPacked(packedStates, index, bits);
+                        if (paletteIndex < 0 || paletteIndex >= palette.size()) {
+                            continue;
+                        }
+                        String state = palette.get(paletteIndex);
+                        if (BlockStateParser.isAirState(state)) {
+                            continue;
+                        }
+
+                        int localX = rawSizeX >= 0 ? x : -x;
+                        int localY = rawSizeY >= 0 ? y : -y;
+                        int localZ = rawSizeZ >= 0 ? z : -z;
+                        int worldX = positionX + localX;
+                        int worldY = positionY + localY;
+                        int worldZ = positionZ + localZ;
+
+                        Schematic.Target target = new Schematic.Target(worldX, worldY, worldZ, state);
+                        unique.putIfAbsent(worldX + "," + worldY + "," + worldZ, target);
+                    }
+                }
+            }
+        }
+
+        return finish(path, Schematic.Format.LITEMATIC, unique);
+    }
+
+    private static String paletteEntryToState(NbtCompound entry) {
+        String name = entry.getString("Name");
+        if (name.isBlank()) {
+            return "minecraft:air";
+        }
+        if (!name.contains(":")) {
+            name = "minecraft:" + name;
+        }
+
+        NbtCompound properties = entry.getCompound("Properties");
+        if (properties.isEmpty()) {
+            return name;
+        }
+
+        List<String> parts = new ArrayList<>();
+        for (String key : properties.getKeys()) {
+            parts.add(key + "=" + properties.getString(key));
+        }
+        parts.sort(String::compareTo);
+        return name + "[" + String.join(",", parts) + "]";
+    }
+
+    private static int readPacked(long[] data, int index, int bits) {
+        int startBit = index * bits;
+        long value = 0L;
+
+        for (int bitOffset = 0; bitOffset < bits; bitOffset++) {
+            int absoluteBit = startBit + bitOffset;
+            int wordIndex = absoluteBit >>> 6;
+            if (wordIndex < 0 || wordIndex >= data.length) {
+                return 0;
+            }
+            long bit = (data[wordIndex] >>> (absoluteBit & 63)) & 1L;
+            value |= bit << bitOffset;
+        }
+
+        return (int) value;
+    }
+
+    private static Schematic readSponge(Path path, NbtCompound root) {
+        int width = root.getInt("Width");
+        int height = root.getInt("Height");
+        int length = root.getInt("Length");
+
+        if (width <= 0 || height <= 0 || length <= 0) {
+            throw new IllegalArgumentException("Width/Height/Length không hợp lệ");
+        }
+
+        long volume = (long) width * height * length;
+        if (volume > MAX_VOLUME) {
+            throw new IllegalArgumentException("bản vẽ có " + volume + " ô, vượt giới hạn " + MAX_VOLUME);
+        }
+
+        // Sponge v2 để Palette và BlockData ở root. Một số exporter bọc chúng
+        // trong compound "Blocks". Hỗ trợ cả hai để file không bị bỏ qua.
+        NbtCompound paletteTag = root.getCompound("Palette");
+        byte[] blockData = root.getByteArray("BlockData");
+
+        if (root.contains("Blocks", NbtElement.COMPOUND_TYPE)) {
+            NbtCompound blocks = root.getCompound("Blocks");
+            if (paletteTag.isEmpty()) {
+                paletteTag = blocks.getCompound("Palette");
+            }
+            if (blockData.length == 0) {
+                blockData = blocks.getByteArray("Data");
+            }
+        }
+
+        if (blockData.length == 0) {
+            blockData = root.getByteArray("Blocks");
+        }
+        if (paletteTag.isEmpty()) {
+            throw new IllegalArgumentException("không tìm thấy Palette");
+        }
+        if (blockData.length == 0) {
+            throw new IllegalArgumentException("không tìm thấy BlockData/Blocks");
+        }
+
+        Map<Integer, String> paletteById = new LinkedHashMap<>();
+        for (String stateName : paletteTag.getKeys()) {
+            int id = paletteTag.getInt(stateName);
+            paletteById.put(id, stateName);
+        }
+
+        Map<String, Schematic.Target> unique = new LinkedHashMap<>();
+        int[] cursor = {0};
+        int limit = (int) Math.min(volume, MAX_VOLUME);
+
+        for (int index = 0; index < limit && unique.size() < MAX_BLOCKS; index++) {
+            int paletteId;
+            try {
+                paletteId = readVarInt(blockData, cursor);
+            } catch (RuntimeException exception) {
+                break;
+            }
+
+            String state = paletteById.get(paletteId);
+            if (state == null || BlockStateParser.isAirState(state)) {
+                continue;
+            }
+
+            int x = index % width;
+            int remainder = index / width;
+            int z = remainder % length;
+            int y = remainder / length;
+
+            Schematic.Target target = new Schematic.Target(x, y, z, state);
+            unique.putIfAbsent(x + "," + y + "," + z, target);
+        }
+
+        return finish(path, Schematic.Format.SPONGE_SCHEM, unique);
+    }
+
+    private static int readVarInt(byte[] data, int[] cursor) {
+        int value = 0;
+        int position = 0;
+
+        while (true) {
+            if (cursor[0] >= data.length || position > 35) {
+                throw new IllegalArgumentException("varint không hợp lệ");
+            }
+            byte current = data[cursor[0]++];
+            value |= (current & 0x7F) << position;
+            if ((current & 0x80) == 0) {
+                return value;
+            }
+            position += 7;
+        }
+    }
+
+    private static Schematic finish(Path path, Schematic.Format format, Map<String, Schematic.Target> unique) {
+        if (unique.isEmpty()) {
+            throw new IllegalArgumentException("không có block không-air");
+        }
+
+        int minX = Integer.MAX_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int minZ = Integer.MAX_VALUE;
+
+        for (Schematic.Target target : unique.values()) {
+            minX = Math.min(minX, target.x());
+            minY = Math.min(minY, target.y());
+            minZ = Math.min(minZ, target.z());
+        }
+
+        List<Schematic.Target> targets = new ArrayList<>(unique.size());
+        List<String> notes = new ArrayList<>();
+        int liquidCount = 0;
+
+        for (Schematic.Target target : unique.values()) {
+            // Bước 2 — TUYỆT ĐỐI bỏ qua chất lỏng (nước, lava, cột bọt khí).
+            // Vị trí được ghi chú để người chơi đặt thủ công nếu cần.
+            if (BlockStateParser.isLiquidState(target.state())) {
+                liquidCount++;
+                if (notes.size() < 3) {
+                    notes.add("Bỏ qua chất lỏng tại (" + (target.x() - minX) + "," + (target.y() - minY) + "," + (target.z() - minZ) + ") — đặt thủ công.");
+                }
+                continue;
+            }
+            targets.add(new Schematic.Target(
+                    target.x() - minX,
+                    target.y() - minY,
+                    target.z() - minZ,
+                    target.state()
+            ));
+        }
+
+        if (liquidCount > 0 && notes.size() < 4) {
+            notes.add("Tổng cộng " + liquidCount + " block chất lỏng đã bỏ qua.");
+        }
+        if (targets.isEmpty()) {
+            throw new IllegalArgumentException("bản vẽ chỉ chứa air/chất lỏng");
+        }
+
+        // Bước 2 — thứ tự xây: dưới lên trên, trong ra ngoài (không tự nhốt).
+        Schematic.sortByBuildOrder(targets);
+
+        return new Schematic(path.getFileName().toString(), format, targets, notes, false);
+    }
+
+    private static String safeMessage(Exception exception) {
+        String message = exception.getMessage();
+        if (message == null || message.isBlank()) {
+            return exception.getClass().getSimpleName();
+        }
+        return message.length() > 160 ? message.substring(0, 160) + "…" : message;
+    }
+}
