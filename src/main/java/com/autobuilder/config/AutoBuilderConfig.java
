@@ -1,0 +1,155 @@
+package com.autobuilder.config;
+
+import com.autobuilder.AutoBuilder;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.fabricmc.loader.api.FabricLoader;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/**
+ * Cấu hình client được lưu cục bộ, không gửi qua mạng.
+ *
+ * Các trường là public có chủ đích: màn hình GUI đọc/ghi trực tiếp và Gson
+ * tuần tự hoá một cách đơn giản, dễ kiểm tra bằng trình soạn thảo văn bản.
+ */
+public final class AutoBuilderConfig {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String FILE_NAME = "autobuilder.json";
+
+    // Bản vẽ và vị trí
+    public String selectedSchematic = "";
+    public int originX = 0;
+    public int originY = 64;
+    public int originZ = 0;
+
+    // Toạ độ rương đồ — bước 2 dùng để tự chạy về lấy block còn thiếu.
+    public boolean useChest = false;
+    public int chestX = 0;
+    public int chestY = 64;
+    public int chestZ = 0;
+
+    // Hành vi đặt block
+    public boolean autoCamera = true;
+    public boolean autoApproach = true;
+    public int placeDelayTicks = 3;
+    public float cameraSpeed = 12.0F;
+
+    // Bước 2 — chế độ và hành vi treo máy
+    // "AUTO" = theo gamemode hiện tại; "SURVIVAL"; "CREATIVE".
+    public String mode = "AUTO";
+    public boolean resupplyFromChest = true;
+    public boolean breakWrongBlocks = true;
+    public boolean autoScaffold = true;
+    public boolean autoEat = true;
+    public int eatAtFoodLevel = 14;
+    // Webhook Discord (https://discord.com/api/webhooks/...). Để trống = tắt.
+    public String webhookUrl = "";
+
+    public static Path configPath() {
+        return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
+    }
+
+    public static AutoBuilderConfig load() {
+        Path path = configPath();
+        if (!Files.isRegularFile(path)) {
+            AutoBuilderConfig defaults = new AutoBuilderConfig();
+            defaults.sanitize();
+            defaults.save();
+            return defaults;
+        }
+
+        try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            AutoBuilderConfig loaded = GSON.fromJson(reader, AutoBuilderConfig.class);
+            if (loaded == null) {
+                loaded = new AutoBuilderConfig();
+            }
+            loaded.sanitize();
+            return loaded;
+        } catch (Exception exception) {
+            AutoBuilder.LOGGER.warn("Could not read {}; using defaults.", path, exception);
+            AutoBuilderConfig safe = new AutoBuilderConfig();
+            safe.sanitize();
+            return safe;
+        }
+    }
+
+    /**
+     * Gọi trên close của Screen. Không dùng trong controller tick để tránh
+     * ghi đĩa mỗi frame.
+     */
+    public void save() {
+        Path path = configPath();
+        try {
+            Files.createDirectories(path.getParent());
+            try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+                GSON.toJson(this, writer);
+            }
+        } catch (IOException exception) {
+            AutoBuilder.LOGGER.warn("Could not save {}", path, exception);
+        }
+    }
+
+    public void sanitize() {
+        if (selectedSchematic == null) {
+            selectedSchematic = "";
+        }
+        placeDelayTicks = clamp(placeDelayTicks, 1, 20);
+        cameraSpeed = clamp(cameraSpeed, 2.0F, 30.0F);
+        eatAtFoodLevel = clamp(eatAtFoodLevel, 2, 19);
+        originY = clamp(originY, -2048, 2048);
+        chestY = clamp(chestY, -2048, 2048);
+        if (!Float.isFinite(cameraSpeed)) {
+            cameraSpeed = 12.0F;
+        }
+        if (mode == null
+                || (!mode.equals("AUTO") && !mode.equals("SURVIVAL") && !mode.equals("CREATIVE"))) {
+            mode = "AUTO";
+        }
+        if (webhookUrl == null) {
+            webhookUrl = "";
+        }
+        webhookUrl = webhookUrl.trim();
+        if (!webhookUrl.isEmpty() && !webhookUrl.startsWith("https://")) {
+            AutoBuilder.LOGGER.warn("Webhook URL phải bắt đầu bằng https:// — tạm tắt webhook.");
+            webhookUrl = "";
+        }
+    }
+
+    public AutoBuilderConfig copy() {
+        AutoBuilderConfig copy = new AutoBuilderConfig();
+        copy.selectedSchematic = selectedSchematic;
+        copy.originX = originX;
+        copy.originY = originY;
+        copy.originZ = originZ;
+        copy.useChest = useChest;
+        copy.chestX = chestX;
+        copy.chestY = chestY;
+        copy.chestZ = chestZ;
+        copy.autoCamera = autoCamera;
+        copy.autoApproach = autoApproach;
+        copy.placeDelayTicks = placeDelayTicks;
+        copy.cameraSpeed = cameraSpeed;
+        copy.mode = mode;
+        copy.resupplyFromChest = resupplyFromChest;
+        copy.breakWrongBlocks = breakWrongBlocks;
+        copy.autoScaffold = autoScaffold;
+        copy.autoEat = autoEat;
+        copy.eatAtFoodLevel = eatAtFoodLevel;
+        copy.webhookUrl = webhookUrl;
+        return copy;
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+}
